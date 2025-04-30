@@ -1,4 +1,3 @@
--- | The constraint solver for unsized type equality constraints.
 module Language.Futhark.TypeChecker.TySolve
   ( Type,
     Solution,
@@ -10,86 +9,33 @@ where
 import Control.Monad
 import Control.Monad.Except
 import Control.Monad.State
+import Control.Monad.ST
 import Data.Bifunctor
 import Data.List qualified as L
 import Data.Loc
 import Data.Map qualified as M
 import Data.Maybe
 import Data.Set qualified as S
-import Debug.Trace
-import Futhark.Util (isEnvVarAtLeast)
 import Futhark.Util.Pretty
 import Language.Futhark
 import Language.Futhark.TypeChecker.Constraints
 import Language.Futhark.TypeChecker.Error
 import Language.Futhark.TypeChecker.Monad (Notes, TypeError (..), aNote, prettyTypeError)
 import Language.Futhark.TypeChecker.Types (substTyVars)
+import Language.Futhark.TypeChecker.UnionFind
+import Futhark.Util (isEnvVarAtLeast)
+import Debug.Trace (trace, traceM)
 
 -- | The type representation used by the constraint solver. Agnostic
 -- to sizes and uniqueness.
 type Type = CtType ()
 
--- | A (partial) solution for a type variable.
-data TyVarSol
-  = -- | Has been substituted with this.
-    TyVarSol Type
-  | -- | Is an explicit (rigid) type parameter in the source program.
-    TyVarParam Level Liftedness Loc
-  | -- | Not substituted yet; has this constraint.
-    TyVarUnsol (TyVarInfo ())
-  deriving (Show)
+type UF s = M.Map TyVar (TyVarNode s)
 
-newtype SolverState = SolverState
-  { -- | Left means linked to this other type variable.
-    solverTyVars :: M.Map TyVar (Either VName TyVarSol)
-  }
+newtype SolverState s = SolverState { solverTyVars :: UF s }
 
-initialState :: TyParams -> TyVars () -> SolverState
-initialState typarams tyvars = SolverState $ M.map g typarams <> M.map f tyvars
-  where
-    f (_lvl, info) = Right $ TyVarUnsol info
-    g (lvl, l, loc) = Right $ TyVarParam lvl l loc
-
-substTyVar :: (Monoid u) => M.Map TyVar (Either VName TyVarSol) -> VName -> Maybe (TypeBase () u)
-substTyVar m v =
-  case M.lookup v m of
-    Just (Left v') -> substTyVar m v'
-    Just (Right (TyVarSol t')) -> Just $ second (const mempty) $ substTyVars (substTyVar m) t'
-    Just (Right TyVarParam {}) -> Nothing
-    Just (Right (TyVarUnsol {})) -> Nothing
-    Nothing -> Nothing
-
-maybeLookupTyVar :: TyVar -> SolveM (Maybe TyVarSol)
-maybeLookupTyVar orig = do
-  tyvars <- gets solverTyVars
-  let f v = case M.lookup v tyvars of
-        Nothing -> pure Nothing
-        Just (Left v') -> f v'
-        Just (Right info) -> pure $ Just info
-  f orig
-
-lookupTyVar :: TyVar -> SolveM (Either (TyVarInfo ()) Type)
-lookupTyVar orig =
-  maybe bad unpack <$> maybeLookupTyVar orig
-  where
-    bad = error $ "Unknown tyvar: " <> prettyNameString orig
-    unpack (TyVarParam {}) = error $ "Is a type param: " <> prettyNameString orig
-    unpack (TyVarSol t) = Right t
-    unpack (TyVarUnsol info) = Left info
-
--- | Variable must be flexible.
-lookupTyVarInfo :: TyVar -> SolveM (TyVarInfo ())
-lookupTyVarInfo v = do
-  r <- lookupTyVar v
-  case r of
-    Left info -> pure info
-    Right _ -> error $ "Tyvar is nonflexible: " <> prettyNameString v
-
-setLink :: TyVar -> VName -> SolveM ()
-setLink v info = modify $ \s -> s {solverTyVars = M.insert v (Left info) $ solverTyVars s}
-
-setInfo :: TyVar -> TyVarSol -> SolveM ()
-setInfo v info = modify $ \s -> s {solverTyVars = M.insert v (Right info) $ solverTyVars s}
+newtype SolveM s a = SolveM { runSolveM :: StateT (SolverState s) (ExceptT TypeError (ST s)) a }
+  deriving (Functor, Applicative, Monad, MonadError TypeError, MonadState (SolverState s))
 
 -- | A solution maps a type variable to its substitution. This
 -- substitution is complete, in the sense there are no right-hand
@@ -100,89 +46,30 @@ type Solution = M.Map TyVar (Either [PrimType] (TypeBase () NoUniqueness))
 -- a constraint on how it can be instantiated.
 type UnconTyVar = (VName, Liftedness)
 
-typeVar :: (Monoid u) => VName -> TypeBase dim u
-typeVar v = Scalar $ TypeVar mempty (qualName v) []
+liftST :: ST s a -> SolveM s a
+liftST = SolveM . lift . lift
 
-solution :: SolverState -> ([UnconTyVar], Solution)
-solution s =
-  ( mapMaybe unconstrained $ M.toList $ solverTyVars s,
-    M.mapMaybe mkSubst $ solverTyVars s
-  )
+initialState :: TyParams -> TyVars () -> SolveM s ()
+initialState typarams tyvars = do
+  tyvars' <- M.traverseWithKey f tyvars
+  typarams' <- M.traverseWithKey g typarams
+  put $ SolverState $ typarams' <> tyvars'
   where
-    mkSubst (Right (TyVarSol t)) =
-      Just $ Right $ first (const ()) $ substTyVars (substTyVar (solverTyVars s)) t
-    mkSubst (Left v') =
-      Just . fromMaybe (Right $ Scalar $ TypeVar mempty (qualName v') []) $
-        mkSubst =<< M.lookup v' (solverTyVars s)
-    mkSubst (Right (TyVarUnsol (TyVarPrim _ pts))) = Just $ Left pts
-    mkSubst _ = Nothing
+    f tv (lvl, info) = liftST $ makeTyVarNode tv lvl info
+    g tv (lvl, lft, loc) = liftST $ makeTyParamNode tv lvl lft loc
 
-    unconstrained (v, Right (TyVarUnsol (TyVarFree _ l))) = Just (v, l)
-    unconstrained _ = Nothing
-
-newtype SolveM a = SolveM {runSolveM :: StateT SolverState (Except TypeError) a}
-  deriving (Functor, Applicative, Monad, MonadState SolverState, MonadError TypeError)
-
--- Try to substitute as much information as we have.
-enrichType :: Type -> SolveM Type
-enrichType t = do
-  s <- get
-  pure $ substTyVars (substTyVar (solverTyVars s)) t
-
-typeError :: Loc -> Notes -> Doc () -> SolveM ()
+typeError :: Loc -> Notes -> Doc () -> SolveM s ()
 typeError loc notes msg =
   throwError $ TypeError loc notes msg
 
-occursCheck :: Reason Type -> VName -> Type -> SolveM ()
-occursCheck reason v tp = do
-  vars <- gets solverTyVars
-  let tp' = substTyVars (substTyVar vars) tp
-  when (v `S.member` typeVars tp') . typeError (locOf reason) mempty $
-    "Occurs check: cannot instantiate"
-      <+> prettyName v
-      <+> "with"
-      <+> pretty tp
-      <> "."
+typeVar :: (Monoid u) => VName -> TypeBase dim u
+typeVar v = Scalar $ TypeVar mempty (qualName v) []
 
-unifySharedConstructors ::
-  Reason Type ->
-  BreadCrumbs ->
-  M.Map Name [Type] ->
-  M.Map Name [Type] ->
-  SolveM ()
-unifySharedConstructors reason bcs cs1 cs2 =
-  forM_ (M.toList $ M.intersectionWith (,) cs1 cs2) $ \(c, (ts1, ts2)) ->
-    if length ts1 == length ts2
-      then zipWithM_ (solveEq reason $ matchingConstructor c <> bcs) ts1 ts2
-      else
-        typeError (locOf reason) mempty $
-          "Cannot unify type with constructor"
-            </> indent 2 (pretty (Sum (M.singleton c ts1)))
-            </> "with type of constructor"
-            </> indent 2 (pretty (Sum (M.singleton c ts2)))
-            </> "because they differ in arity."
-
-unifySharedFields ::
-  Reason Type ->
-  BreadCrumbs ->
-  M.Map Name Type ->
-  M.Map Name Type ->
-  SolveM ()
-unifySharedFields reason bcs fs1 fs2 =
-  forM_ (M.toList $ M.intersectionWith (,) fs1 fs2) $ \(f, (ts1, ts2)) ->
-    solveEq reason (matchingField f <> bcs) ts1 ts2
-
-scopeViolation :: Reason Type -> VName -> Type -> VName -> SolveM ()
-scopeViolation reason v1 ty v2 =
-  typeError (locOf reason) mempty $
-    "Cannot unify type"
-      </> indent 2 (pretty ty)
-      </> "with"
-      <+> dquotes (prettyName v1)
-      <+> "(scope violation)."
-      </> "This is because"
-      <+> dquotes (prettyName v2)
-      <+> "is rigidly bound in a deeper scope."
+enrichType :: Type -> SolveM s Type
+enrichType t = do
+  s <- get
+  uf <- convertUF (solverTyVars s)
+  pure $ substTyVars (substTyVar uf) t
 
 cannotUnify ::
   Reason Type ->
@@ -190,7 +77,7 @@ cannotUnify ::
   BreadCrumbs ->
   Type ->
   Type ->
-  SolveM ()
+  SolveM s ()
 cannotUnify reason notes bcs t1 t2 = do
   t1' <- enrichType t1
   t2' <- enrichType t2
@@ -279,19 +166,56 @@ cannotUnify reason notes bcs t1 t2 = do
           "Latter:" <+> pretty latter'
         ]
 
--- Precondition: 'v' is currently flexible.
-subTyVar :: Reason Type -> BreadCrumbs -> VName -> Type -> SolveM ()
-subTyVar reason bcs v t = do
-  occursCheck reason v t
-  v_info <- gets $ M.lookup v . solverTyVars
+unsharedConstructorsMsg :: M.Map Name t -> M.Map Name t -> Doc a
+unsharedConstructorsMsg cs1 cs2 =
+  "Unshared constructors:" <+> commasep (map (("#" <>) . pretty) missing) <> "."
+  where
+    missing =
+      filter (`notElem` M.keys cs1) (M.keys cs2)
+        ++ filter (`notElem` M.keys cs2) (M.keys cs1)
 
-  -- Set a solution for v, then update info for t in case v has any
-  -- odd constraints.
-  setInfo v (TyVarSol t)
+convertUF :: UF s -> SolveM s (M.Map TyVar TyVarSol)
+convertUF uf = do
+  mappings <- mapM maybeLookupSol (M.toList uf)
+  pure $ M.fromList $ catMaybes mappings
+  where
+    maybeLookupSol :: (TyVar, TyVarNode s) -> SolveM s (Maybe (TyVar, TyVarSol))
+    maybeLookupSol (tv, node) = do
+      root <- liftST $ find node
+      descr <- liftST $ getDescr root
+      pure $ case descr of
+        t@(Solved _) -> Just (tv, t)
+        _ -> Nothing
+
+substTyVar :: (Monoid u) => M.Map TyVar TyVarSol -> VName -> Maybe (TypeBase () u)
+substTyVar m v =
+  case M.lookup v m of
+    Just (Solved t') -> Just $ second (const mempty) $ substTyVars (substTyVar m) t'
+    _ -> Nothing
+
+occursCheck :: Reason Type -> VName -> Type -> SolveM s ()
+occursCheck reason v tp = do
+  vars <- gets solverTyVars
+  vars' <- convertUF vars
+  let tp' = substTyVars (substTyVar vars') tp
+  when (v `S.member` typeVars tp') . typeError (locOf reason) mempty $
+    "Occurs check: cannot instantiate"
+      <+> prettyName v
+      <+> "with"
+      <+> pretty tp
+      <> "."
+
+bindTyVar :: Reason Type -> BreadCrumbs -> VName -> Type -> SolveM s ()
+bindTyVar reason bcs v t = do
+  occursCheck reason v t
+  v_node <- lookupUF v
+  v_info <- liftST $ getDescr v_node
+
+  setInfo v_node (Solved t)
 
   case (v_info, t) of
-    ( Just (Right (TyVarUnsol TyVarFree {})), _ ) -> pure ()
-    ( Just (Right (TyVarUnsol (TyVarPrim _ v_pts))), _ ) ->
+    ( Unsolved TyVarFree {}, _ ) -> pure ()
+    ( Unsolved (TyVarPrim _ v_pts), _ ) ->
         if t `elem` map (Scalar . Prim) v_pts
           then pure ()
           else cannotUnify reason notes bcs (typeVar v) t
@@ -302,7 +226,7 @@ subTyVar reason bcs v t = do
                 </> indent 2 (pretty v_pts)
                 </> "with"
                 </> indent 2 (pretty t)
-    ( Just (Right (TyVarUnsol (TyVarSum _ cs1))), Scalar (Sum cs2) ) ->
+    ( Unsolved (TyVarSum _ cs1), Scalar (Sum cs2) ) ->
         if all (`elem` M.keys cs2) (M.keys cs1)
           then unifySharedConstructors reason bcs cs1 cs2
           else cannotUnify reason notes bcs (typeVar v) t
@@ -314,13 +238,13 @@ subTyVar reason bcs v t = do
                 </> "with type with constructors"
                 </> indent 2 (stack (map (("#" <>) . pretty) (M.keys cs2)))
                 </> unsharedConstructorsMsg cs1 cs2
-    ( Just (Right (TyVarUnsol (TyVarSum _ cs1))), _ ) ->
+    ( Unsolved (TyVarSum _ cs1), _ ) ->
         typeError (locOf reason) mempty $
           "Cannot unify type with constructors"
             </> indent 2 (pretty (Sum cs1))
             </> "with type"
             </> indent 2 (pretty t)
-    ( Just (Right (TyVarUnsol (TyVarRecord _ fs1))), Scalar (Record fs2) ) ->
+    ( Unsolved (TyVarRecord _ fs1), Scalar (Record fs2) ) ->
         if all (`elem` M.keys fs2) (M.keys fs1)
           then unifySharedFields reason bcs fs1 fs2
           else
@@ -329,7 +253,7 @@ subTyVar reason bcs v t = do
                 </> indent 2 (pretty (Record fs1))
                 </> "with record type"
                 </> indent 2 (pretty (Record fs2))
-    ( Just (Right (TyVarUnsol (TyVarRecord _ fs1))), _ ) ->
+    ( Unsolved (TyVarRecord _ fs1), _ ) ->
         typeError (locOf reason) mempty $
           "Cannot unify record type with fields"
             </> indent 2 (pretty (Record fs1))
@@ -337,132 +261,71 @@ subTyVar reason bcs v t = do
             </> indent 2 (pretty t)
     --
     -- Internal error cases
-    (Just (Right TyVarSol {}), _) ->
+    (Solved {}, _) ->
       error $ "Type variable already solved: " <> prettyNameString v
-    (Just (Right TyVarParam {}), _) ->
+    (Param {}, _) ->
       error $ "Cannot substitute type parameter: " <> prettyNameString v
-    (Just Left {}, _) ->
-      error $ "Type variable already linked: " <> prettyNameString v
-    (Nothing, _) ->
-      error $ "subTyVar: Nothing v: " <> prettyNameString v
+    -- ({}, _) ->
+    --   error $ "Type variable already linked: " <> prettyNameString v
+    -- (Nothing, _) ->
+    --   error $ "subTyVar: Nothing v: " <> prettyNameString v
 
--- Precondition: 'v' and 't' are both currently flexible.
---
--- The purpose of this function is to combine the partial knowledge we
--- may have about these two type variables.
-unionTyVars :: Reason Type -> BreadCrumbs -> VName -> VName -> SolveM ()
-unionTyVars reason bcs v t = do
-  v_info <- gets $ either alreadyLinked id . fromMaybe unknown . M.lookup v . solverTyVars
-  t_info <- lookupTyVarInfo t
+solveCt :: CtTy () -> SolveM s ()
+solveCt (CtEq reason t1 t2) = solveEq reason mempty t1 t2
 
-  -- Insert the link from v to t, and then update the info of t based
-  -- on the existing info of v and t.
-  setLink v t
-
-  case (v_info, t_info) of
-    ( TyVarUnsol (TyVarFree _ v_l),
-      TyVarFree t_loc t_l
-      )
-        | v_l /= t_l ->
-            setInfo t $ TyVarUnsol $ TyVarFree t_loc (min v_l t_l)
-    -- When either is completely unconstrained.
-    (TyVarUnsol TyVarFree {}, _) ->
-      pure ()
-    ( TyVarUnsol info,
-      TyVarFree {}
-      ) ->
-        setInfo t (TyVarUnsol info)
-    --
-    -- TyVarPrim cases
-    ( TyVarUnsol (TyVarPrim _ v_pts),
-      TyVarPrim t_loc t_pts
-      ) ->
-        let pts = L.intersect v_pts t_pts
-         in if null pts
-              then
-                typeError (locOf reason) mempty $
-                  "Cannot unify type that must be one of"
-                    </> indent 2 (pretty v_pts)
-                    </> "with type that must be one of"
-                    </> indent 2 (pretty t_pts)
-              else setInfo t (TyVarUnsol (TyVarPrim t_loc pts))
-    ( TyVarUnsol (TyVarPrim _ v_pts),
-      TyVarRecord {}
-      ) ->
-        typeError (locOf reason) mempty $
-          "Cannot unify type that must be one of"
-            </> indent 2 (pretty v_pts)
-            </> "with type that must be a record."
-    ( TyVarUnsol (TyVarPrim _ v_pts),
-      TyVarSum {}
-      ) ->
-        typeError (locOf reason) mempty $
-          "Cannot unify type that must be one of"
-            </> indent 2 (pretty v_pts)
-            </> "with type that must be sum."
-    --
-    -- TyVarSum cases
-    ( TyVarUnsol (TyVarSum _ cs1),
-      TyVarSum loc cs2
-      ) -> do
-        unifySharedConstructors reason bcs cs1 cs2
-        let cs3 = cs1 <> cs2
-        setInfo t (TyVarUnsol (TyVarSum loc cs3))
-    ( TyVarUnsol TyVarSum {},
-      TyVarPrim _ pts
-      ) ->
-        typeError (locOf reason) mempty $
-          "A sum type cannot be one of"
-            </> indent 2 (pretty pts)
-    ( TyVarUnsol (TyVarSum _ cs1),
-      TyVarRecord _ fs
-      ) ->
-        typeError (locOf reason) mempty $
-          "Cannot unify type with constructors"
-            </> indent 2 (pretty (Sum cs1))
-            </> "with type"
-            </> indent 2 (pretty (Scalar (Record fs)))
-    --
-    -- TyVarRecord cases
-    ( TyVarUnsol (TyVarRecord _ fs1),
-      TyVarRecord loc fs2
-      ) -> do
-        unifySharedFields reason bcs fs1 fs2
-        let fs3 = fs1 <> fs2
-        setInfo t (TyVarUnsol (TyVarRecord loc fs3))
-    ( TyVarUnsol TyVarRecord {},
-      TyVarPrim _ pts
-      ) ->
-        typeError (locOf reason) mempty $
-          "A record type cannot be one of"
-            </> indent 2 (pretty pts)
-    ( TyVarUnsol (TyVarRecord _ fs1),
-      TyVarSum _ cs
-      ) ->
-        typeError (locOf reason) mempty $
-          "Cannot unify record type"
-            </> indent 2 (pretty (Record fs1))
-            </> "with type"
-            </> indent 2 (pretty (Scalar (Sum cs)))
-    --
-    -- Internal error cases
-    (TyVarSol {}, _) ->
-      alreadySolved
-    (TyVarParam {}, _) ->
-      isParam
+solveEq :: Reason Type -> BreadCrumbs -> Type -> Type -> SolveM s ()
+solveEq reason obcs orig_t1 orig_t2 = do
+  solveCt' (obcs, (orig_t1, orig_t2))
   where
-    unknown = error $ "unionTyVars: Nothing v: " <> prettyNameString v
-    alreadyLinked = error $ "Type variable already linked: " <> prettyNameString v
-    alreadySolved = error $ "Type variable already solved: " <> prettyNameString v
-    isParam = error $ "Type name is a type parameter: " <> prettyNameString v
+    flexible :: VName -> SolveM s Bool
+    flexible v = do
+      uf <- gets solverTyVars
+      case M.lookup v uf of
+        Just node -> do
+          sol <- liftST $ getDescr node
+          pure $ case sol of
+            Unsolved _ -> True
+            _ -> False
+        Nothing -> pure False
 
-unsharedConstructorsMsg :: M.Map Name t -> M.Map Name t -> Doc a
-unsharedConstructorsMsg cs1 cs2 =
-  "Unshared constructors:" <+> commasep (map (("#" <>) . pretty) missing) <> "."
-  where
-    missing =
-      filter (`notElem` M.keys cs1) (M.keys cs2)
-        ++ filter (`notElem` M.keys cs2) (M.keys cs1)
+    sub :: TypeBase () NoUniqueness -> SolveM s (TypeBase () NoUniqueness)
+    sub t@(Scalar (TypeVar _ (QualName [] v) [])) = do
+      uf <- gets solverTyVars
+      case M.lookup v uf of
+        Just node -> do
+          descr <- liftST $ getDescr node
+          case descr of
+            Solved t' -> sub t'
+            _ -> pure t
+        _ -> pure t
+    sub t = pure t
+
+    solveCt' :: (BreadCrumbs, (Type, Type)) -> SolveM s ()
+    solveCt' (bcs, (t1, t2)) = do
+      sub_t1 <- sub t1
+      sub_t2 <- sub t2
+      case (sub_t1, sub_t2) of
+        ( t1'@(Scalar (TypeVar _ (QualName [] v1) [])),
+          t2'@(Scalar (TypeVar _ (QualName [] v2) []))
+          )
+            | v1 == v2 -> pure ()
+            | otherwise -> do
+                v1_flexible <- flexible v1
+                v2_flexible <- flexible v2
+                case (v1_flexible, v2_flexible) of
+                  (False, False) -> cannotUnify reason mempty bcs t1 t2
+                  (True, False) -> bindTyVar reason bcs v1 t2'
+                  (False, True) -> bindTyVar reason bcs v2 t1'
+                  (True, True) -> unionTyVars reason bcs v1 v2
+        (Scalar (TypeVar _ (QualName [] v1) []), t2') -> do
+          v1_flexible <- flexible v1
+          when v1_flexible $ bindTyVar reason bcs v1 t2'
+        (t1', Scalar (TypeVar _ (QualName [] v2) [])) -> do
+          v2_flexible <- flexible v2
+          when v2_flexible $ bindTyVar reason bcs v2 t1'
+        (t1', t2') -> case unify t1' t2' of
+          Left details -> cannotUnify reason (aNote details) bcs t1' t2'
+          Right eqs -> mapM_ solveCt' eqs
 
 -- Unify at the root, emitting new equalities that must hold.
 unify :: Type -> Type -> Either (Doc a) [(BreadCrumbs, (Type, Type))]
@@ -518,78 +381,215 @@ unify t1 t2
       Right [(mempty, (t1', t2'))]
 unify _ _ = Left mempty
 
-solveEq :: Reason Type -> BreadCrumbs -> Type -> Type -> SolveM ()
-solveEq reason obcs orig_t1 orig_t2 = do
-  solveCt' (obcs, (orig_t1, orig_t2))
+maybeLookupTyVar :: TyVar -> SolveM s (Maybe TyVarSol)
+maybeLookupTyVar tv = do
+  tyvars <- gets solverTyVars
+  case M.lookup tv tyvars of
+    Nothing -> pure Nothing
+    Just node -> do
+      sol <- liftST $ getDescr node
+      pure $ Just sol
+
+lookupTyVar :: TyVar -> SolveM s (Either (TyVarInfo ()) Type)
+lookupTyVar tv =
+  maybe bad unpack <$> maybeLookupTyVar tv
   where
-    solveCt' (bcs, (t1, t2)) = do
-      tyvars <- gets solverTyVars
-      let flexible v = case M.lookup v tyvars of
-            Just (Left v') -> flexible v'
-            Just (Right (TyVarUnsol _)) -> True
-            Just (Right TyVarSol {}) -> False
-            Just (Right TyVarParam {}) -> False
-            Nothing -> False
-          normalize t@(Scalar (TypeVar u (QualName [] v) [])) =
-            case M.lookup v tyvars of
-              Just (Left v') -> normalize $ Scalar (TypeVar u (QualName [] v') [])
-              Just (Right (TyVarSol t')) -> normalize t'
-              _ -> t
-          normalize t = t
-      case (normalize t1, normalize t2) of
-        ( t1'@(Scalar (TypeVar _ (QualName [] v1) [])),
-          t2'@(Scalar (TypeVar _ (QualName [] v2) []))
-          )
-            | v1 == v2 -> pure ()
-            | otherwise ->
-                case (flexible v1, flexible v2) of
-                  (False, False) -> cannotUnify reason mempty bcs t1 t2
-                  (True, False) -> subTyVar reason bcs v1 t2'
-                  (False, True) -> subTyVar reason bcs v2 t1'
-                  (True, True) -> unionTyVars reason bcs v1 v2
-        (Scalar (TypeVar _ (QualName [] v1) []), t2')
-          | flexible v1 -> subTyVar reason bcs v1 t2'
-        (t1', Scalar (TypeVar _ (QualName [] v2) []))
-          | flexible v2 -> subTyVar reason bcs v2 t1'
-        (t1', t2') -> case unify t1' t2' of
-          Left details -> cannotUnify reason (aNote details) bcs t1' t2'
-          Right eqs -> mapM_ solveCt' eqs
+    bad = error $ "Unknown tyvar: " <> prettyNameString tv
+    unpack (Param {}) = error $ "Is a type param: " <> prettyNameString tv
+    unpack (Solved t) = Right t
+    unpack (Unsolved info) = Left info
 
-solveCt :: CtTy () -> SolveM ()
-solveCt ct =
-  case ct of
-    CtEq reason t1 t2 -> solveEq reason mempty t1 t2
+lookupTyVarInfo :: TyVar -> SolveM s (TyVarInfo ())
+lookupTyVarInfo v = do
+  r <- lookupTyVar v
+  case r of
+    Left info -> pure info
+    Right _ -> error $ "Tyvar is nonflexible: " <> prettyNameString v
 
-scopeCheck :: Reason Type -> TyVar -> Int -> Type -> SolveM ()
+lookupUF :: TyVar -> SolveM s (TyVarNode s)
+lookupUF tv = do
+  uf <- gets solverTyVars
+  case M.lookup tv uf of
+    Nothing -> error $ "Unknown tyvar: " <> prettyNameString tv
+    Just node -> pure node
+
+unifySharedFields ::
+  Reason Type ->
+  BreadCrumbs ->
+  M.Map Name Type ->
+  M.Map Name Type ->
+  SolveM s ()
+unifySharedFields reason bcs fs1 fs2 =
+  forM_ (M.toList $ M.intersectionWith (,) fs1 fs2) $ \(f, (ts1, ts2)) ->
+    solveEq reason (matchingField f <> bcs) ts1 ts2
+
+unifySharedConstructors ::
+  Reason Type ->
+  BreadCrumbs ->
+  M.Map Name [Type] ->
+  M.Map Name [Type] ->
+  SolveM s ()
+unifySharedConstructors reason bcs cs1 cs2 =
+  forM_ (M.toList $ M.intersectionWith (,) cs1 cs2) $ \(c, (ts1, ts2)) ->
+    if length ts1 == length ts2
+      then zipWithM_ (solveEq reason $ matchingConstructor c <> bcs) ts1 ts2
+      else
+        typeError (locOf reason) mempty $
+          "Cannot unify type with constructor"
+            </> indent 2 (pretty (Sum (M.singleton c ts1)))
+            </> "with type of constructor"
+            </> indent 2 (pretty (Sum (M.singleton c ts2)))
+            </> "because they differ in arity."
+
+setInfo :: TyVarNode s -> TyVarSol -> SolveM s ()
+setInfo node sol = liftST $ assignNewSol node sol
+
+unionTyVars :: Reason Type -> BreadCrumbs -> VName -> VName -> SolveM s ()
+unionTyVars reason bcs v t = do
+  v_node <- lookupUF v
+  t_node <- lookupUF t
+  v_sol <- liftST $ getDescr v_node
+  t_info <- lookupTyVarInfo t
+
+  -- Unify the equivalence classes of v and t.
+  liftST $ union v_node t_node
+
+  case (v_sol, t_info) of
+    (Unsolved (TyVarFree _ v_l), TyVarFree t_loc t_l)
+      | v_l /= t_l ->
+        setInfo t_node $ Unsolved $ TyVarFree t_loc (min v_l t_l)
+    (Unsolved TyVarFree {}, _) -> pure ()
+    (Unsolved info, TyVarFree {}) -> do
+      setInfo t_node $ Unsolved info
+    --
+    -- TyVarPrim cases
+    ( Unsolved (TyVarPrim _ v_pts),
+      TyVarPrim t_loc t_pts
+      ) ->
+        let pts = L.intersect v_pts t_pts
+         in if null pts
+              then
+                typeError (locOf reason) mempty $
+                  "Cannot unify type that must be one of"
+                    </> indent 2 (pretty v_pts)
+                    </> "with type that must be one of"
+                    </> indent 2 (pretty t_pts)
+              else setInfo t_node (Unsolved (TyVarPrim t_loc pts))
+    ( Unsolved (TyVarPrim _ v_pts),
+      TyVarRecord {}
+      ) ->
+        typeError (locOf reason) mempty $
+          "Cannot unify type that must be one of"
+            </> indent 2 (pretty v_pts)
+            </> "with type that must be a record."
+    ( Unsolved (TyVarPrim _ v_pts),
+      TyVarSum {}
+      ) ->
+        typeError (locOf reason) mempty $
+          "Cannot unify type that must be one of"
+            </> indent 2 (pretty v_pts)
+            </> "with type that must be sum."
+    --
+    -- TyVarSum cases
+    ( Unsolved (TyVarSum _ cs1),
+      TyVarSum loc cs2
+      ) -> do
+        unifySharedConstructors reason bcs cs1 cs2
+        let cs3 = cs1 <> cs2
+        setInfo t_node $ Unsolved $ TyVarSum loc cs3
+    ( Unsolved TyVarSum {},
+      TyVarPrim _ pts
+      ) ->
+        typeError (locOf reason) mempty $
+          "A sum type cannot be one of"
+            </> indent 2 (pretty pts)
+    ( Unsolved (TyVarSum _ cs1),
+      TyVarRecord _ fs
+      ) ->
+        typeError (locOf reason) mempty $
+          "Cannot unify type with constructors"
+            </> indent 2 (pretty (Sum cs1))
+            </> "with type"
+            </> indent 2 (pretty (Scalar (Record fs)))
+    --
+    -- TyVarRecord cases
+    ( Unsolved (TyVarRecord _ fs1),
+      TyVarRecord loc fs2
+      ) -> do
+        unifySharedFields reason bcs fs1 fs2
+        let fs3 = fs1 <> fs2
+        setInfo t_node (Unsolved (TyVarRecord loc fs3))
+    ( Unsolved TyVarRecord {},
+      TyVarPrim _ pts
+      ) ->
+        typeError (locOf reason) mempty $
+          "A record type cannot be one of"
+            </> indent 2 (pretty pts)
+    ( Unsolved (TyVarRecord _ fs1),
+      TyVarSum _ cs
+      ) ->
+        typeError (locOf reason) mempty $
+          "Cannot unify record type"
+            </> indent 2 (pretty (Record fs1))
+            </> "with type"
+            </> indent 2 (pretty (Scalar (Sum cs)))
+    --
+    -- Internal error cases
+    (Solved {}, _) -> alreadySolved
+    (Param {}, _) -> isParam
+
+  where
+    alreadySolved = error $ "Type variable already solved: " <> prettyNameString v
+    isParam = error $ "Type name is a type parameter: " <> prettyNameString v
+
+scopeViolation :: Reason Type -> VName -> Type -> VName -> SolveM s ()
+scopeViolation reason v1 ty v2 =
+  typeError (locOf reason) mempty $
+    "Cannot unify type"
+      </> indent 2 (pretty ty)
+      </> "with"
+      <+> dquotes (prettyName v1)
+      <+> "(scope violation)."
+      </> "This is because"
+      <+> dquotes (prettyName v2)
+      <+> "is rigidly bound in a deeper scope."
+
+scopeCheck :: Reason Type -> TyVar -> Int -> Type -> SolveM s ()
 scopeCheck reason v v_lvl ty = mapM_ check $ typeVars ty
   where
+    check :: TyVar -> SolveM s ()
     check ty_v = do
-      ty_v_info <- gets $ M.lookup ty_v . solverTyVars
-      case ty_v_info of
-        Just (Right (TyVarParam ty_v_lvl _ _))
-          -- Type parameter has a higher level than the (free) type variable.
-          | ty_v_lvl > v_lvl -> scopeViolation reason v ty ty_v
-        Just (Right (TyVarSol ty')) ->
-          mapM_ check $ typeVars ty'
+      mb_node <- gets $ M.lookup ty_v . solverTyVars
+      case mb_node of
+        Just node -> do
+          descr <- liftST $ getDescr node
+          case descr of
+            Param ty_v_lvl _ _
+              -- Type parameter has a higher level than the (free) type variable.
+              | ty_v_lvl > v_lvl -> scopeViolation reason v ty ty_v
+            Solved ty' ->
+              mapM_ check $ typeVars ty'
+            _ -> pure ()
         _ -> pure ()
 
 -- If a type variable has a liftedness constraint, we propagate that
 -- constraint to its solution. The actual checking for correct usage
 -- is done later.
-liftednessCheck :: Liftedness -> Type -> SolveM ()
+liftednessCheck :: Liftedness -> Type -> SolveM s ()
 liftednessCheck l (Scalar (TypeVar _ (QualName [] v) _)) = do
   v_info <- maybeLookupTyVar v
   case v_info of
     Nothing ->
       -- Is an opaque type.
       pure ()
-    Just (TyVarSol v_ty) ->
+    Just (Solved v_ty) ->
       liftednessCheck l v_ty
-    Just TyVarParam {} -> pure ()
-    Just (TyVarUnsol (TyVarFree loc v_l))
-      | l /= v_l ->
-          setInfo v $ TyVarUnsol $ TyVarFree loc (min l v_l)
-    Just TyVarUnsol {} -> pure ()
+    Just Param {} -> pure ()
+    Just (Unsolved (TyVarFree loc v_l))
+      | l /= v_l -> do
+          node <- lookupUF v
+          setInfo node $ Unsolved $ TyVarFree loc (min l v_l)
+    Just Unsolved {} -> pure ()
 liftednessCheck _ (Scalar Prim {}) = pure ()
 liftednessCheck Lifted _ = pure ()
 liftednessCheck _ Array {} = pure ()
@@ -600,7 +600,7 @@ liftednessCheck l (Scalar (Sum cs)) =
   mapM_ (mapM_ $ liftednessCheck l) cs
 liftednessCheck _ (Scalar TypeVar {}) = pure ()
 
-solveTyVar :: (VName, (Level, TyVarInfo ())) -> SolveM ()
+solveTyVar :: (VName, (Level, TyVarInfo ())) -> SolveM s ()
 solveTyVar (tv, (_, TyVarRecord loc fs1)) = do
   tv_t <- lookupTyVar tv
   case tv_t of
@@ -633,8 +633,9 @@ solveTyVar (tv, (_, TyVarPrim loc pts)) = do
   tv_t <- lookupTyVar tv
   case tv_t of
     Right (Scalar (Prim ty))
-      | [ty] == pts ->
-          setInfo tv $ TyVarSol $ Scalar $ Prim ty
+      | [ty] == pts -> do
+          node <- lookupUF tv
+          setInfo node (Solved $ Scalar $ Prim ty)
     Right ty
       | ty `elem` map (Scalar . Prim) pts -> pure ()
       | otherwise ->
@@ -643,6 +644,53 @@ solveTyVar (tv, (_, TyVarPrim loc pts)) = do
               </> indent 2 (align (pretty ty))
               </> "which is not possible."
     _ -> pure ()
+
+convertUF' :: UF s -> SolveM s (M.Map TyVar (Either VName TyVarSol))
+convertUF' uf = do
+  mappings <- mapM lookupSol $ M.toList uf
+  pure $ M.fromList mappings
+  where
+    lookupSol :: (TyVar, TyVarNode s) -> SolveM s (TyVar, Either VName TyVarSol)
+    lookupSol (tv, node) = do
+      k <- liftST $ getKey node
+      descr <- liftST $ getDescr node
+      traceM $ "descr: " ++ show descr
+      traceM $ "k: " ++ show k
+      traceM $ "tv: " ++ show tv
+      t <- if k /= tv then
+                  case descr of 
+                    Solved _ -> pure $ Right descr
+                    _        -> pure $ Left k
+                else pure $ Right descr
+      traceM $ "t: " ++ show t
+      pure (tv, t)
+
+substTyVar' :: (Monoid u) => M.Map TyVar (Either VName TyVarSol) -> VName -> Maybe (TypeBase () u)
+substTyVar' m v =
+  case M.lookup v m of
+    Just (Left v') -> substTyVar' m v'
+    Just (Right (Solved t')) -> Just $ second (const mempty) $ substTyVars (substTyVar' m) t'
+    Just (Right Param {}) -> Nothing
+    Just (Right (Unsolved {})) -> Nothing
+    Nothing -> Nothing
+
+solution :: SolverState s -> SolveM s ([UnconTyVar], Solution)
+solution st = do
+  mappings <- convertUF' $ solverTyVars st
+  let unconstrained = mapMaybe unconstr $ M.toList mappings
+  let sol = M.mapMaybe (mkSubst mappings) mappings
+  pure (unconstrained, sol)
+  where
+    unconstr :: (TyVar, Either VName TyVarSol) -> Maybe UnconTyVar
+    unconstr (v, Right (Unsolved (TyVarFree _ l))) = Just (v, l)
+    unconstr _ = Nothing
+
+    mkSubst m (Right (Solved t)) =
+      Just $ Right $ first (const ()) $ substTyVars (substTyVar' m) t
+    mkSubst _ (Right (Unsolved (TyVarPrim _ pts))) = Just $ Left pts
+    mkSubst _ (Left v) =
+      Just $ Right $ Scalar $ TypeVar mempty (qualName v) []
+    mkSubst _ _ = Nothing
 
 -- Print in a way helpful for writing a test case for TySolveTests.
 logSolution ::
@@ -688,16 +736,19 @@ solve ::
   Either TypeError ([UnconTyVar], Solution)
 solve constraints typarams tyvars =
   maybeLog
-    . second solution
-    . runExcept
-    . flip execStateT (initialState typarams tyvars)
+    $ runST
+    $ runExceptT
+    . flip evalStateT (SolverState M.empty)
     . runSolveM
     $ do
+      initialState typarams tyvars
       mapM_ solveCt constraints
-      mapM_ solveTyVar (M.toList tyvars)
-  where
-    maybeLog
-      | isEnvVarAtLeast "FUTHARK_LOG_TYSOLVE" 0 = \s ->
-          trace (logSolution constraints typarams tyvars s) s
-      | otherwise = id
+      mapM_ solveTyVar $ M.toList tyvars
+      s <- get
+      solution s
+    where
+  maybeLog
+    | isEnvVarAtLeast "FUTHARK_LOG_TYSOLVE" 0 = \s ->
+        trace (logSolution constraints typarams tyvars s) s
+    | otherwise = id
 {-# NOINLINE solve #-}

@@ -14,7 +14,7 @@ import Language.Futhark.TypeChecker.Constraints
     TyVars,
   )
 import Language.Futhark.TypeChecker.Monad (prettyTypeError, TypeError(TypeError))
-import Language.Futhark.TypeChecker.TySolveNew
+import Language.Futhark.TypeChecker.TySolve
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (Assertion, assertFailure, testCase, (@?=), assertBool)
 import Text.Regex.TDFA ( (=~) )
@@ -308,5 +308,25 @@ tests =
           ["a_0" ~ "(i32, c_2)", "b_1" ~ "(i32, c_2, bool)", "a_0" ~ "b_1"]
           mempty
           (M.fromList [tv "a_0" 0, tv "b_1" 0])
-          ".?([Cc]annot unify).?"
+          ".?([Cc]annot unify).?",
+      testCase "Prim type last substitution" $
+        testSolve
+          [
+            "t\8321_8321" ~ "num\8320_8320",
+            "index\8322_8322" ~ "index_elem\8323_8323",
+            "[]t_0" ~ "[]index_elem\8323_8323"
+          ]
+          (M.fromList [typaram "t_0" 0 Unlifted])
+          (M.fromList [
+            ("num\8320_8320", (2,TyVarPrim NoLoc [Signed Int8,Signed Int16,Signed Int32,Signed Int64,Unsigned Int8,Unsigned Int16,Unsigned Int32,Unsigned Int64,FloatType Float16,FloatType Float32,FloatType Float64])),
+            ("t\8321_8321",(2, TyVarPrim NoLoc [Signed Int8,Signed Int16,Signed Int32,Signed Int64])),
+            ("index\8322_8322", (2,TyVarFree NoLoc Unlifted)),
+            ("index_elem\8323_8323", (2,TyVarFree NoLoc Unlifted))
+          ])
+          ([], M.fromList [
+            ("num\8320_8320", Left [Signed Int8,Signed Int16,Signed Int32,Signed Int64]),
+            ("t\8321_8321", Left [Signed Int8,Signed Int16,Signed Int32,Signed Int64]),
+            ("index\8322_8322",Right "t_0"),
+            ("index_elem\8323_8323",Right "t_0")
+          ])
     ]
